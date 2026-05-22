@@ -5,9 +5,12 @@
 # Вимога: python-telegram-bot >= 20.0
 # ======================================================
 
+import os
 import sys
 import asyncio
 import logging
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 try:
     import telegram
@@ -65,6 +68,39 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ── Health-check HTTP server (для UptimeRobot / Render keep-alive) ──────────
+
+PORT = int(os.getenv("PORT", 10000))
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    """Мінімальний HTTP-обробник: відповідає OK на / і /health."""
+
+    def do_GET(self) -> None:
+        if self.path in ("/", "/health"):
+            body = b"OK"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    # Заглушка логів — щоб не смітити в консолі при кожному пінгу
+    def log_message(self, format: str, *args) -> None:  # noqa: A002
+        pass
+
+
+def _start_health_server() -> None:
+    server = HTTPServer(("0.0.0.0", PORT), _HealthHandler)
+    logger.info("Health server слухає на порту %d", PORT)
+    server.serve_forever()
+
+
+# ── Conversation handler ─────────────────────────────────────────────────────
+
 def build_conversation() -> ConversationHandler:
     return ConversationHandler(
         entry_points=[
@@ -111,6 +147,8 @@ def build_conversation() -> ConversationHandler:
     )
 
 
+# ── Async main ───────────────────────────────────────────────────────────────
+
 async def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(build_conversation())
@@ -135,4 +173,8 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    # Запускаємо health server у фоновому daemon-потоці
+    # daemon=True → потік автоматично завершиться разом із процесом
+    threading.Thread(target=_start_health_server, daemon=True).start()
+
     asyncio.run(main())
