@@ -416,7 +416,9 @@ async def handle_html_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if query.data == "confirm_schedule":
         await query.edit_message_text("📅 Обираємо дату публікації…")
-        return await _show_schedule_picker(query.message, context)
+        # Передаємо chat_id явно — надійніше ніж query.message після edit
+        await _show_schedule_picker(update.effective_chat.id, context)
+        return SCHEDULE_DATE
 
     status = "publish" if query.data == "confirm_publish" else "draft"
     label  = "Публікую новину…" if status == "publish" else "Зберігаю чернетку…"
@@ -444,7 +446,14 @@ async def handle_html_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ══════════════════════════════════════════════════════
 # КРОК 9 — Запланована публікація
 # ══════════════════════════════════════════════════════
-async def _show_schedule_picker(message, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def _show_schedule_picker(
+    chat_id: int, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """
+    Надсилає picker дати через context.bot.send_message(chat_id=...).
+    НЕ через message.reply_text — той об'єкт після edit_message_text
+    може бути нестабільним і не надіслати повідомлення.
+    """
     now   = datetime.now(KYIV_TZ)
     today = now.date()
 
@@ -458,14 +467,15 @@ async def _show_schedule_picker(message, context: ContextTypes.DEFAULT_TYPE) -> 
         day_btn("📅 Сьогодні",    today),
         day_btn("📅 Завтра",      today + timedelta(days=1)),
         day_btn("📅 Післязавтра", today + timedelta(days=2)),
-        [InlineKeyboardButton("✏️ Ввести дату вручну", callback_data="sched_manual")],
+        [InlineKeyboardButton("⌨️ Ввести дату вручну", callback_data="sched_manual")],
         [InlineKeyboardButton("❌ Скасувати",          callback_data="sched_cancel")],
     ]
 
-    await message.reply_text(
-        "🗓 *Запланована публікація*\n\nОберіть дату або введіть вручну:",
-        reply_markup=InlineKeyboardMarkup(buttons),
-        parse_mode="Markdown",
+    await context.bot.send_message(
+        chat_id    = chat_id,
+        text       = "🗓 *Запланована публікація*\n\nОберіть дату або введіть вручну:",
+        reply_markup = InlineKeyboardMarkup(buttons),
+        parse_mode = "Markdown",
     )
     return SCHEDULE_DATE
 
@@ -505,7 +515,17 @@ async def handle_schedule_date(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def handle_schedule_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Обробляє текстове введення дати/часу в стані SCHEDULE_DATE.
+    Викликається після того як користувач обрав день (KEY_SCHED_DATE = date)
+    або натиснув «Ввести вручну» (KEY_SCHED_DATE = None).
+    """
     if KEY_SCHED_DATE not in context.user_data:
+        # Це не має траплятись у нормальному флоу, але якщо трапилось —
+        # повідомляємо користувача замість тихого ігнорування
+        await update.message.reply_text(
+            "⚠️ Спочатку оберіть дату зі списку або натисніть «⌨️ Ввести дату вручну»."
+        )
         return SCHEDULE_DATE
 
     text        = update.message.text.strip()
