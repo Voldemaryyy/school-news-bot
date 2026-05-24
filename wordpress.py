@@ -8,7 +8,7 @@
 # ======================================================
 
 import logging
-from datetime import datetime, timezone as _utc
+from datetime import datetime, timezone
 from xmlrpc.client import Binary, ServerProxy, DateTime as XmlRpcDateTime
 
 from wordpress_xmlrpc import Client, WordPressPost, WordPressTerm
@@ -97,7 +97,7 @@ def _finalize_post(
         # Київський local time — те що відображається на сайті
         local_naive = publish_date.replace(tzinfo=None)
         # UTC — для внутрішньої логіки WordPress і future-планування
-        utc_naive   = publish_date.astimezone(_utc).replace(tzinfo=None)
+        utc_naive   = publish_date.astimezone(timezone.utc).replace(tzinfo=None)
 
         # Конструюємо через рядок — стабільно в усіх версіях Python
         fields["post_date"]     = _to_xmlrpc_date(local_naive)
