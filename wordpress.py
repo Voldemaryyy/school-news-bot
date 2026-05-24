@@ -8,7 +8,7 @@
 # ======================================================
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone as _utc
 from xmlrpc.client import Binary, ServerProxy, DateTime as XmlRpcDateTime
 
 from wordpress_xmlrpc import Client, WordPressPost, WordPressTerm
@@ -53,44 +53,75 @@ def upload_image(image_bytes: bytes, filename: str = "photo.jpg") -> dict:
 
 
 # ══════════════════════════════════════════════════════
-# ВСТАНОВЛЕННЯ FEATURED IMAGE (сировий XML-RPC)
+# ФІНАЛІЗАЦІЯ ПОСТА (featured image + дата)
 # ══════════════════════════════════════════════════════
-def _set_featured_image(post_id: str | int, media_id: str | int) -> None:
+def _finalize_post(
+    post_id: str | int,
+    media_id: str | int,
+    publish_date: datetime | None = None,
+) -> None:
     """
-    Встановлює featured image через сировий XML-RPC виклик.
+    Один виклик wp.editPost через сировий ServerProxy, який встановлює:
+      1. post_thumbnail  — featured image (мініатюра)
+      2. post_date       — дата публікації за Київом (якщо передана)
+      3. post_date_gmt   — дата публікації в UTC   (якщо передана)
 
-    ЧОМУ не через python-wordpress-xmlrpc:
-      EditPost з новим WordPressPost() надсилає ВСІ поля об'єкта,
-      включно з порожніми — це скидає заголовок поста на "Untitled".
+    ЧОМУ не через python-wordpress-xmlrpc EditPost:
+      Новий WordPressPost() надсилає ВСІ поля (включно з порожніми)
+      → WordPress скидає заголовок на "Untitled".
 
-    РІШЕННЯ: wp.editPost з мінімальним словником {"post_thumbnail": id}.
-      WordPress оновлює ТІЛЬКИ ці поля, решта залишається без змін.
+    ЧОМУ editPost для дати, а не тільки NewPost:
+      WordPress ігнорує post_date в NewPost якщо status="publish"
+      і просто ставить поточний час. EditPost після створення
+      примусово перезаписує дату — єдиний надійний спосіб.
+
+    ФОРМАТ дати: XmlRpcDateTime (dateTime.iso8601) — рідний тип XML-RPC.
+      post_date    = Київський час як naive datetime  → WordPress зберігає as-is
+      post_date_gmt = UTC як naive datetime           → WordPress використовує для
+                                                        сортування і планування
     """
-    proxy = ServerProxy(_XMLRPC_URL)
+    proxy  = ServerProxy(_XMLRPC_URL)
+    fields: dict = {"post_thumbnail": int(media_id)}
+
+    if publish_date is not None:
+        # Київський local time (naive) — те що відображається на сайті
+        local_naive = publish_date.replace(tzinfo=None)
+        # UTC (naive) — для внутрішньої логіки WordPress і future-планування
+        utc_naive   = publish_date.astimezone(_utc).replace(tzinfo=None)
+
+        fields["post_date"]     = XmlRpcDateTime(local_naive)
+        fields["post_date_gmt"] = XmlRpcDateTime(utc_naive)
+
+        logger.info(
+            "wp.editPost date: local=%s  utc=%s",
+            local_naive.strftime("%Y-%m-%d %H:%M:%S"),
+            utc_naive.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+
     logger.info(
-        "XML-RPC wp.editPost: встановлюю post_thumbnail=%s для поста %s",
-        media_id, post_id,
+        "wp.editPost: post_id=%s  fields=%s",
+        post_id, list(fields.keys()),
     )
     try:
         result = proxy.wp.editPost(
-            0,           # blog_id (завжди 0 для single-site)
+            0,            # blog_id (завжди 0 для single-site)
             WP_USER,
             WP_PASSWORD,
             int(post_id),
-            {"post_thumbnail": int(media_id)},
+            fields,
         )
-        logger.info("XML-RPC wp.editPost OK: result=%s", result)
+        logger.info("wp.editPost OK: result=%s", result)
     except Exception as e:
-        # Не падаємо — пост вже створено
+        # Пост вже створено — не падаємо, тільки попереджаємо
         logger.warning(
-            "wp.editPost: не вдалось встановити featured image: %s\n"
-            "Встановіть мініатюру вручну в WordPress Admin → Медіафайли.",
+            "wp.editPost: не вдалось встановити thumbnail/дату: %s\n"
+            "Перевірте мініатюру і дату вручну в WordPress Admin.",
             e,
         )
 
 
 # ══════════════════════════════════════════════════════
-# СТВОРЕННЯ ПОСТУ
+# СТВОРЕННЯ ПОСТА
 # ══════════════════════════════════════════════════════
 def create_post(
     title: str,
@@ -101,13 +132,19 @@ def create_post(
     publish_date: datetime | None = None,
 ) -> dict:
     """
-    Крок 1 — wp.newPost через python-wordpress-xmlrpc:
-              title, content, status, category, publish_date.
-    Крок 2 — wp.editPost через сировий ServerProxy:
-              ТІЛЬКИ post_thumbnail, без торкання інших полів.
+    Крок 1 — NewPost: створює пост з title, content, status, category.
+              Якщо publish_date передана — додає post.date як перший hint
+              для WordPress (може ігноруватись при status="publish").
+
+    Крок 2 — _finalize_post: один wp.editPost встановлює:
+              • post_thumbnail (featured image) — завжди
+              • post_date + post_date_gmt       — якщо publish_date передана
+              Це гарантує правильну дату навіть для backdated publish.
 
     status: "draft" | "publish" | "future"
-    publish_date: timezone-aware datetime (Київ) для status="future"
+    publish_date: timezone-aware datetime (Київ)
+                  past/now  → status="publish", дата виставляється заднім числом
+                  future    → status="future",  WordPress публікує автоматично
 
     Повертає: {id: str, link: str}
     """
@@ -115,16 +152,18 @@ def create_post(
 
     # ── Крок 1: NewPost ───────────────────────────────
     post = WordPressPost()
-    post.title       = str(title)          # явний str — захист від None
+    post.title       = str(title)   # str() захищає від None
     post.content     = content
     post.post_status = status
 
-    # Дата запланованої публікації
-    if publish_date is not None and status == "future":
-        # Передаємо як naive local time (WordPress інтерпретує за timezone блогу)
-        dt_naive = publish_date.replace(tzinfo=None)
-        post.date = XmlRpcDateTime(dt_naive)
-        logger.info("Запланована дата: %s (local naive)", dt_naive)
+    # Передаємо дату в NewPost для БУДЬ-ЯКОГО статусу якщо вона є.
+    # Для "future" WordPress її обов'язково враховує.
+    # Для "publish" — може ігнорувати, але _finalize_post виправить це.
+    if publish_date is not None:
+        local_naive = publish_date.replace(tzinfo=None)
+        post.date   = XmlRpcDateTime(local_naive)
+        logger.info("NewPost publish_date: %s (local naive, status=%s)",
+                    local_naive.strftime("%Y-%m-%d %H:%M:%S"), status)
 
     # Категорія
     term          = WordPressTerm()
@@ -132,18 +171,15 @@ def create_post(
     term.taxonomy = "category"
     post.terms    = [term]
 
-    logger.info(
-        "XML-RPC NewPost: title='%s' status=%s cat=%s",
-        title, status, category_id,
-    )
+    logger.info("NewPost: title='%s'  status=%s  cat=%s", title, status, category_id)
     try:
         post_id = client.call(posts.NewPost(post))
     except Exception as e:
         raise RuntimeError(f"Помилка створення поста: {e}") from e
-    logger.info("XML-RPC NewPost OK: post_id=%s", post_id)
+    logger.info("NewPost OK: post_id=%s", post_id)
 
-    # ── Крок 2: featured image (тільки post_thumbnail) ─
-    _set_featured_image(post_id, featured_media_id)
+    # ── Крок 2: featured image + дата (один виклик editPost) ─
+    _finalize_post(post_id, featured_media_id, publish_date=publish_date)
 
     # ── Отримуємо permalink ───────────────────────────
     try:
@@ -152,5 +188,5 @@ def create_post(
     except Exception:
         link = f"{WP_URL.rstrip('/')}/?p={post_id}"
 
-    logger.info("XML-RPC готово: id=%s link=%s", post_id, link)
+    logger.info("Готово: id=%s  link=%s", post_id, link)
     return {"id": str(post_id), "link": link}
